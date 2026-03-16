@@ -10,6 +10,7 @@ session_start();
 define('SITE_NAME', 'W-ASSIST');
 define('UPLOAD_DIR', 'uploads/');
 define('SECRET_KEY', 'WASSIST');
+define('ADMIN_PASSWORD', password_hash('admin123', PASSWORD_DEFAULT));
 
 /* ===========================================
    SECTION 3 : CONNEXION À LA BASE DE DONNÉES
@@ -23,19 +24,27 @@ try {
 }
 
 /* ===========================================
-   SECTION 4 : CRÉATION DES TABLES
+   SECTION 4 : CRÉATION DES TABLES CORRIGÉE
 =========================================== */
 $pdo->exec("
+-- Table users avec index
 CREATE TABLE IF NOT EXISTS users(
     id SERIAL PRIMARY KEY,
-    nom VARCHAR(100) NOT NULL,
+    nom VARCHAR(50) NOT NULL,
+    prenom VARCHAR(50) NOT NULL,
     email VARCHAR(150) UNIQUE NOT NULL,
+    password VARCHAR(255),
+    google_id VARCHAR(255),
+    telephone VARCHAR(20),
     role VARCHAR(20) DEFAULT 'user',
     avatar VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_login TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
 
+-- Table temoignages
 CREATE TABLE IF NOT EXISTS temoignages(
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -45,7 +54,22 @@ CREATE TABLE IF NOT EXISTS temoignages(
     date_pub TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     approved BOOLEAN DEFAULT TRUE
 );
+CREATE INDEX IF NOT EXISTS idx_temoignages_user ON temoignages(user_id);
+CREATE INDEX IF NOT EXISTS idx_temoignages_date ON temoignages(date_pub DESC);
 
+-- Table pour les likes
+CREATE TABLE IF NOT EXISTS likes(
+    id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
+    content_type VARCHAR(20) NOT NULL,
+    content_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, content_type, content_id)
+);
+CREATE INDEX IF NOT EXISTS idx_likes_user ON likes(user_id);
+CREATE INDEX IF NOT EXISTS idx_likes_content ON likes(content_type, content_id);
+
+-- Table demandes_aide
 CREATE TABLE IF NOT EXISTS demandes_aide(
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -57,7 +81,10 @@ CREATE TABLE IF NOT EXISTS demandes_aide(
     date_demande TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     date_traitement TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_demandes_user ON demandes_aide(user_id);
+CREATE INDEX IF NOT EXISTS idx_demandes_status ON demandes_aide(status);
 
+-- Table articles
 CREATE TABLE IF NOT EXISTS articles(
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -69,7 +96,11 @@ CREATE TABLE IF NOT EXISTS articles(
     vendu BOOLEAN DEFAULT FALSE,
     date_ajout TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_articles_user ON articles(user_id);
+CREATE INDEX IF NOT EXISTS idx_articles_categorie ON articles(categorie);
+CREATE INDEX IF NOT EXISTS idx_articles_prix ON articles(prix);
 
+-- Table discussions principale
 CREATE TABLE IF NOT EXISTS discussions(
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -79,7 +110,23 @@ CREATE TABLE IF NOT EXISTS discussions(
     likes INT DEFAULT 0,
     date_msg TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_discussions_date ON discussions(date_msg DESC);
 
+-- Table des réponses aux discussions
+CREATE TABLE IF NOT EXISTS discussion_reponses(
+    id SERIAL PRIMARY KEY,
+    discussion_id INT REFERENCES discussions(id) ON DELETE CASCADE,
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
+    message TEXT NOT NULL,
+    media VARCHAR(255),
+    type_media VARCHAR(20),
+    likes INT DEFAULT 0,
+    date_reponse TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reponses_discussion ON discussion_reponses(discussion_id);
+CREATE INDEX IF NOT EXISTS idx_reponses_date ON discussion_reponses(date_reponse DESC);
+
+-- Table messages_prives
 CREATE TABLE IF NOT EXISTS messages_prives(
     id SERIAL PRIMARY KEY,
     sender_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -88,7 +135,10 @@ CREATE TABLE IF NOT EXISTS messages_prives(
     lu BOOLEAN DEFAULT FALSE,
     date_envoi TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_messages_users ON messages_prives(sender_id, receiver_id);
+CREATE INDEX IF NOT EXISTS idx_messages_lu ON messages_prives(receiver_id, lu);
 
+-- Table notifications
 CREATE TABLE IF NOT EXISTS notifications(
     id SERIAL PRIMARY KEY,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -97,45 +147,72 @@ CREATE TABLE IF NOT EXISTS notifications(
     lu BOOLEAN DEFAULT FALSE,
     date_notif TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, lu);
 ");
 
 /* ===========================================
    SECTION 5 : FONCTIONS UTILITAIRES
 =========================================== */
 
-/**
- * Gère l'upload de fichiers
- */
+function generateCSRFToken() {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
 function uploadFile($file, $allowedTypes = ['jpg', 'jpeg', 'png', 'gif', 'mp4', 'avi', 'mov', 'webm']) {
     if (!is_dir(UPLOAD_DIR)) {
         mkdir(UPLOAD_DIR, 0777, true);
     }
     
-    $filename = time() . '_' . preg_replace('/[^a-zA-Z0-9_\.-]/', '_', $file['name']);
-    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-    
-    if (!in_array($ext, $allowedTypes)) {
+    if ($file['error'] !== UPLOAD_ERR_OK) {
         return false;
     }
     
+    if ($file['size'] > 10 * 1024 * 1024) {
+        return false;
+    }
+    
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mimeType = finfo_file($finfo, $file['tmp_name']);
+    finfo_close($finfo);
+    
+    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    $allowedMimes = [
+        'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'png' => 'image/png',
+        'gif' => 'image/gif',
+        'mp4' => 'video/mp4',
+        'avi' => 'video/x-msvideo',
+        'mov' => 'video/quicktime',
+        'webm' => 'video/webm'
+    ];
+    
+    if (!isset($allowedMimes[$ext]) || $allowedMimes[$ext] !== $mimeType) {
+        return false;
+    }
+    
+    $filename = uniqid() . '_' . preg_replace('/[^a-zA-Z0-9_\.-]/', '_', $file['name']);
+    
     if (move_uploaded_file($file['tmp_name'], UPLOAD_DIR . $filename)) {
+        chmod(UPLOAD_DIR . $filename, 0644);
         return $filename;
     }
     
     return false;
 }
 
-/**
- * Crée une notification
- */
 function createNotification($pdo, $userId, $message, $type = 'info') {
     $stmt = $pdo->prepare("INSERT INTO notifications(user_id, message, type) VALUES (?, ?, ?)");
     return $stmt->execute([$userId, $message, $type]);
 }
 
-/**
- * Formate la date
- */
 function formatDate($date) {
     $now = new DateTime();
     $dateObj = new DateTime($date);
@@ -144,15 +221,59 @@ function formatDate($date) {
     if ($interval->d == 0) {
         if ($interval->h == 0) {
             if ($interval->i < 1) return "À l'instant";
-            return "Il y a " . $interval->i . " min";
+            if ($interval->i == 1) return "Il y a 1 minute";
+            return "Il y a " . $interval->i . " minutes";
         }
-        return "Il y a " . $interval->h . " h";
+        if ($interval->h == 1) return "Il y a 1 heure";
+        return "Il y a " . $interval->h . " heures";
     }
     
     if ($interval->d == 1) return "Hier";
-    if ($interval->d < 7) return "Il y a " . $interval->d . " jours";
+    if ($interval->d < 7) {
+        if ($interval->d == 1) return "Il y a 1 jour";
+        return "Il y a " . $interval->d . " jours";
+    }
     
     return $dateObj->format('d/m/Y H:i');
+}
+
+function verifyPassword($pdo, $userId, $password) {
+    $stmt = $pdo->prepare("SELECT password FROM users WHERE id = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch();
+    
+    return $user && password_verify($password, $user['password']);
+}
+
+function hasUserLiked($pdo, $userId, $type, $itemId) {
+    $stmt = $pdo->prepare("SELECT id FROM likes WHERE user_id = ? AND content_type = ? AND content_id = ?");
+    $stmt->execute([$userId, $type, $itemId]);
+    return $stmt->fetch() !== false;
+}
+
+function addLike($pdo, $userId, $type, $itemId) {
+    try {
+        $pdo->beginTransaction();
+        
+        if (hasUserLiked($pdo, $userId, $type, $itemId)) {
+            $pdo->rollBack();
+            return false;
+        }
+        
+        $stmt = $pdo->prepare("INSERT INTO likes(user_id, content_type, content_id) VALUES (?, ?, ?)");
+        $stmt->execute([$userId, $type, $itemId]);
+        
+        $table = ($type === 'temoignage') ? 'temoignages' : 
+                 (($type === 'discussion') ? 'discussions' : 'discussion_reponses');
+        $stmt = $pdo->prepare("UPDATE $table SET likes = likes + 1 WHERE id = ?");
+        $stmt->execute([$itemId]);
+        
+        $pdo->commit();
+        return true;
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        return false;
+    }
 }
 
 /* ===========================================
@@ -160,6 +281,9 @@ function formatDate($date) {
 =========================================== */
 $page = $_GET['page'] ?? 'login';
 $action = $_GET['action'] ?? null;
+$discussion_id = $_GET['discussion_id'] ?? null;
+
+$csrf_token = generateCSRFToken();
 
 /* ===========================================
    SECTION 7 : TRAITEMENT DES FORMULAIRES
@@ -167,134 +291,295 @@ $action = $_GET['action'] ?? null;
 
 // 7.1 : Inscription
 if (isset($_POST['register'])) {
-    $nom = trim($_POST['nom']);
-    $email = trim($_POST['email']);
-    
-    if ($nom && filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        try {
-            $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
-            $stmt->execute([$email]);
-            
-            if ($stmt->rowCount() > 0) {
-                $_SESSION['error'] = 'Cet email est déjà utilisé.';
-            } else {
-                $stmt = $pdo->prepare("INSERT INTO users(nom, email) VALUES(?, ?)");
-                $stmt->execute([$nom, $email]);
-                
-                $_SESSION['success'] = 'Compte créé avec succès !';
-                header('Location: ?page=login');
-                exit;
-            }
-        } catch (PDOException $e) {
-            $_SESSION['error'] = 'Une erreur est survenue.';
-        }
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité. Veuillez réessayer.';
     } else {
-        $_SESSION['error'] = 'Veuillez remplir tous les champs correctement.';
+        $nom = trim($_POST['nom']);
+        $prenom = trim($_POST['prenom']);
+        $email = trim($_POST['email']);
+        $password = $_POST['password'];
+        $confirm_password = $_POST['confirm_password'];
+        $telephone = trim($_POST['telephone']);
+        
+        $errors = [];
+        
+        if (!$nom || !$prenom || !$email || !$password || !$telephone) {
+            $errors[] = 'Tous les champs sont obligatoires.';
+        }
+        
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $errors[] = 'Email invalide.';
+        }
+        
+        if (strlen($password) < 8) {
+            $errors[] = 'Le mot de passe doit contenir au moins 8 caractères.';
+        }
+        
+        if (!preg_match('/[A-Z]/', $password)) {
+            $errors[] = 'Le mot de passe doit contenir au moins une majuscule.';
+        }
+        
+        if (!preg_match('/[0-9]/', $password)) {
+            $errors[] = 'Le mot de passe doit contenir au moins un chiffre.';
+        }
+        
+        if ($password !== $confirm_password) {
+            $errors[] = 'Les mots de passe ne correspondent pas.';
+        }
+        
+        if (!preg_match('/^[0-9]{8,}$/', $telephone)) {
+            $errors[] = 'Numéro de téléphone invalide (minimum 8 chiffres).';
+        }
+        
+        if (empty($errors)) {
+            try {
+                $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
+                $stmt->execute([$email]);
+                
+                if ($stmt->rowCount() > 0) {
+                    $_SESSION['error'] = 'Cet email est déjà utilisé.';
+                } else {
+                    $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
+                    $stmt = $pdo->prepare("INSERT INTO users(nom, prenom, email, password, telephone) VALUES(?, ?, ?, ?, ?)");
+                    $stmt->execute([$nom, $prenom, $email, $hashedPassword, $telephone]);
+                    
+                    $_SESSION['success'] = 'Compte créé avec succès ! Vous pouvez maintenant vous connecter.';
+                    header('Location: ?page=login');
+                    exit;
+                }
+            } catch (PDOException $e) {
+                $_SESSION['error'] = 'Une erreur est survenue.';
+            }
+        } else {
+            $_SESSION['error'] = implode('<br>', $errors);
+        }
     }
 }
 
 // 7.2 : Connexion
 if (isset($_POST['login'])) {
-    $email = trim($_POST['email']);
-    
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
-    $stmt->execute([$email]);
-    $user = $stmt->fetch();
-    
-    if ($user) {
-        $updateStmt = $pdo->prepare("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?");
-        $updateStmt->execute([$user['id']]);
-        
-        $_SESSION['user'] = $user;
-        createNotification($pdo, $user['id'], 'Bienvenue sur W-ASSIST !', 'welcome');
-        header('Location: ?page=dashboard');
-        exit;
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité. Veuillez réessayer.';
     } else {
-        $_SESSION['error'] = 'Email inconnu. Veuillez créer un compte.';
+        $email = trim($_POST['email']);
+        $password = $_POST['password'];
+        
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+        $stmt->execute([$email]);
+        $user = $stmt->fetch();
+        
+        if ($user && password_verify($password, $user['password'])) {
+            session_regenerate_id(true);
+            
+            $updateStmt = $pdo->prepare("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?");
+            $updateStmt->execute([$user['id']]);
+            
+            $_SESSION['user'] = $user;
+            $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'];
+            $_SESSION['ip_address'] = $_SERVER['REMOTE_ADDR'];
+            
+            createNotification($pdo, $user['id'], 'Bienvenue sur W-ASSIST !', 'welcome');
+            header('Location: ?page=dashboard');
+            exit;
+        } else {
+            $_SESSION['error'] = 'Email ou mot de passe incorrect.';
+        }
     }
 }
 
-// 7.3 : Déconnexion
+// 7.3 : Connexion avec Google
+if (isset($_GET['google_login'])) {
+    $_SESSION['google_auth'] = true;
+    header('Location: ?page=google_callback');
+    exit;
+}
+
+if ($page == 'google_callback' && isset($_SESSION['google_auth'])) {
+    $google_email = 'user' . rand(1000, 9999) . '@gmail.com';
+    $google_nom = 'User';
+    $google_prenom = 'Google';
+    
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ? OR google_id IS NOT NULL");
+    $stmt->execute([$google_email]);
+    $user = $stmt->fetch();
+    
+    if (!$user) {
+        $stmt = $pdo->prepare("INSERT INTO users(nom, prenom, email, google_id) VALUES(?, ?, ?, ?)");
+        $stmt->execute([$google_nom, $google_prenom, $google_email, 'google_' . uniqid()]);
+        
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+        $stmt->execute([$google_email]);
+        $user = $stmt->fetch();
+    }
+    
+    $_SESSION['user'] = $user;
+    createNotification($pdo, $user['id'], 'Bienvenue sur W-ASSIST (connexion Google) !', 'welcome');
+    unset($_SESSION['google_auth']);
+    header('Location: ?page=dashboard');
+    exit;
+}
+
+// 7.4 : Déconnexion
 if ($page == 'logout') {
     session_destroy();
     header('Location: ?page=login');
     exit;
 }
 
-// 7.4 : Témoignage
+// 7.5 : Témoignage
 if (isset($_POST['add_temoignage']) && isset($_SESSION['user'])) {
-    $message = trim($_POST['message']);
-    $categorie = $_POST['categorie'] ?? null;
-    
-    if ($message) {
-        $stmt = $pdo->prepare("INSERT INTO temoignages(user_id, message, categorie) VALUES(?, ?, ?)");
-        if ($stmt->execute([$_SESSION['user']['id'], $message, $categorie])) {
-            $_SESSION['success'] = 'Témoignage publié avec succès !';
-            header('Location: ?page=temoignages');
-            exit;
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
+    } else {
+        $message = trim($_POST['message']);
+        $categorie = $_POST['categorie'] ?? null;
+        
+        if ($message) {
+            $stmt = $pdo->prepare("INSERT INTO temoignages(user_id, message, categorie) VALUES(?, ?, ?)");
+            if ($stmt->execute([$_SESSION['user']['id'], $message, $categorie])) {
+                $_SESSION['success'] = 'Témoignage publié avec succès !';
+                header('Location: ?page=temoignages');
+                exit;
+            }
         }
     }
 }
 
-// 7.5 : Like témoignage
+// 7.6 : Like témoignage
 if ($action == 'like_temoignage' && isset($_SESSION['user'])) {
     $id = $_GET['id'] ?? 0;
     if ($id) {
-        $stmt = $pdo->prepare("UPDATE temoignages SET likes = likes + 1 WHERE id = ?");
-        $stmt->execute([$id]);
-        echo json_encode(['success' => true]);
+        $result = addLike($pdo, $_SESSION['user']['id'], 'temoignage', $id);
+        echo json_encode(['success' => $result, 'alreadyLiked' => !$result]);
         exit;
     }
 }
 
-// 7.6 : Demande aide
+// 7.7 : Demande aide
 if (isset($_POST['add_aide']) && isset($_SESSION['user'])) {
-    $situation = trim($_POST['situation']);
-    $contact = trim($_POST['contact']);
-    $circonstances = trim($_POST['circonstances']);
-    $urgence = $_POST['urgence'] ?? 'moyenne';
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
+    } else {
+        $situation = trim($_POST['situation']);
+        $contact = trim($_POST['contact']);
+        $circonstances = trim($_POST['circonstances']);
+        $urgence = $_POST['urgence'] ?? 'moyenne';
+        
+        if ($situation && $contact && $circonstances) {
+            $stmt = $pdo->prepare("INSERT INTO demandes_aide(user_id, situation, contact, circonstances, urgence) VALUES(?, ?, ?, ?, ?)");
+            if ($stmt->execute([$_SESSION['user']['id'], $situation, $contact, $circonstances, $urgence])) {
+                createNotification($pdo, $_SESSION['user']['id'], 'Votre demande d\'aide a été enregistrée.', 'aide');
+                $_SESSION['success'] = 'Demande envoyée avec succès !';
+                header('Location: ?page=aide');
+                exit;
+            }
+        }
+    }
+}
+
+// 7.8 : Mettre à jour le statut d'une demande d'aide
+if ($action == 'update_help_status' && isset($_SESSION['user'])) {
+    $id = $_GET['id'] ?? 0;
+    $status = $_GET['status'] ?? '';
     
-    if ($situation && $contact && $circonstances) {
-        $stmt = $pdo->prepare("INSERT INTO demandes_aide(user_id, situation, contact, circonstances, urgence) VALUES(?, ?, ?, ?, ?)");
-        if ($stmt->execute([$_SESSION['user']['id'], $situation, $contact, $circonstances, $urgence])) {
-            createNotification($pdo, $_SESSION['user']['id'], 'Votre demande d\'aide a été enregistrée.', 'aide');
-            $_SESSION['success'] = 'Demande envoyée avec succès !';
-            header('Location: ?page=aide');
+    if ($id && in_array($status, ['en_attente', 'traite', 'refuse'])) {
+        $stmt = $pdo->prepare("SELECT user_id FROM demandes_aide WHERE id = ?");
+        $stmt->execute([$id]);
+        $demande = $stmt->fetch();
+        
+        if ($demande && $demande['user_id'] == $_SESSION['user']['id']) {
+            $stmt = $pdo->prepare("UPDATE demandes_aide SET status = ?, date_traitement = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$status, $id]);
+            
+            createNotification($pdo, $_SESSION['user']['id'], "Votre demande d'aide a été " . ($status == 'traite' ? 'traitée' : 'refusée'), 'aide');
+            $_SESSION['success'] = 'Statut mis à jour avec succès !';
+        }
+    }
+    header('Location: ?page=aide');
+    exit;
+}
+
+// 7.9 : Articles
+if (isset($_POST['add_article']) && isset($_SESSION['user'])) {
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
+    } else {
+        $titre = trim($_POST['titre']);
+        $description = trim($_POST['description']);
+        $prix = is_numeric($_POST['prix']) ? (float)$_POST['prix'] : 0;
+        $categorie = $_POST['categorie'] ?? null;
+        $secret = trim($_POST['secret']);
+        
+        $image = null;
+        if (!empty($_FILES['image']['name'])) {
+            $image = uploadFile($_FILES['image'], ['jpg', 'jpeg', 'png', 'gif']);
+        }
+        
+        if ($titre && $description && $prix > 0) {
+            if ($secret === SECRET_KEY) {
+                $stmt = $pdo->prepare("INSERT INTO articles(user_id, titre, description, prix, categorie, image) VALUES(?, ?, ?, ?, ?, ?)");
+                if ($stmt->execute([$_SESSION['user']['id'], $titre, $description, $prix, $categorie, $image])) {
+                    $_SESSION['success'] = 'Article ajouté avec succès !';
+                    header('Location: ?page=articles');
+                    exit;
+                }
+            } else {
+                $_SESSION['error'] = 'Mot secret incorrect.';
+            }
+        } else {
+            $_SESSION['error'] = 'Veuillez remplir tous les champs correctement.';
+        }
+    }
+}
+
+// 7.10 : Supprimer un article
+if ($action == 'delete_article' && isset($_SESSION['user'])) {
+    $id = $_GET['id'] ?? 0;
+    
+    if ($id) {
+        $stmt = $pdo->prepare("SELECT user_id FROM articles WHERE id = ?");
+        $stmt->execute([$id]);
+        $article = $stmt->fetch();
+        
+        if ($article && $article['user_id'] == $_SESSION['user']['id']) {
+            $_SESSION['delete_article_id'] = $id;
+            header('Location: ?page=verify_delete_password');
             exit;
         }
     }
+    header('Location: ?page=articles');
+    exit;
 }
 
-// 7.7 : Articles
-if (isset($_POST['add_article']) && isset($_SESSION['user'])) {
-    $titre = trim($_POST['titre']);
-    $description = trim($_POST['description']);
-    $prix = is_numeric($_POST['prix']) ? (float)$_POST['prix'] : 0;
-    $categorie = $_POST['categorie'] ?? null;
-    $secret = trim($_POST['secret']);
-    
-    $image = null;
-    if (!empty($_FILES['image']['name'])) {
-        $image = uploadFile($_FILES['image'], ['jpg', 'jpeg', 'png', 'gif']);
-    }
-    
-    if ($titre && $description && $prix > 0) {
-        if ($secret === SECRET_KEY) {
-            $stmt = $pdo->prepare("INSERT INTO articles(user_id, titre, description, prix, categorie, image) VALUES(?, ?, ?, ?, ?, ?)");
-            if ($stmt->execute([$_SESSION['user']['id'], $titre, $description, $prix, $categorie, $image])) {
-                $_SESSION['success'] = 'Article ajouté avec succès !';
-                header('Location: ?page=articles');
-                exit;
-            }
-        } else {
-            $_SESSION['error'] = 'Mot secret incorrect.';
-        }
+// 7.11 : Vérification du mot de passe pour la suppression
+if (isset($_POST['verify_delete_password']) && isset($_SESSION['user'])) {
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
     } else {
-        $_SESSION['error'] = 'Veuillez remplir tous les champs correctement.';
+        $password = $_POST['password'];
+        $admin_password = $_POST['admin_password'] ?? '';
+        $article_id = $_SESSION['delete_article_id'] ?? 0;
+        
+        if ($article_id) {
+            $userVerified = verifyPassword($pdo, $_SESSION['user']['id'], $password);
+            $adminVerified = password_verify($admin_password, ADMIN_PASSWORD);
+            
+            if ($userVerified && $adminVerified) {
+                $stmt = $pdo->prepare("DELETE FROM articles WHERE id = ? AND user_id = ?");
+                $stmt->execute([$article_id, $_SESSION['user']['id']]);
+                
+                unset($_SESSION['delete_article_id']);
+                $_SESSION['success'] = 'Article supprimé avec succès !';
+            } else {
+                $_SESSION['error'] = 'Mot de passe utilisateur ou mot de passe admin incorrect.';
+            }
+        }
     }
+    header('Location: ?page=articles');
+    exit;
 }
 
-// 7.8 : Marquer article comme vendu
+// 7.12 : Marquer article comme vendu
 if ($action == 'mark_sold' && isset($_SESSION['user'])) {
     $id = $_GET['id'] ?? 0;
     if ($id) {
@@ -305,58 +590,96 @@ if ($action == 'mark_sold' && isset($_SESSION['user'])) {
     }
 }
 
-// 7.9 : Discussion avec media
+// 7.13 : Discussion principale
 if (isset($_POST['add_discussion']) && isset($_SESSION['user'])) {
-    $message = trim($_POST['message']);
-    
-    $media = null;
-    $type = null;
-    
-    if (!empty($_FILES['media']['name'])) {
-        $media = uploadFile($_FILES['media']);
-        if ($media) {
-            $ext = strtolower(pathinfo($media, PATHINFO_EXTENSION));
-            $type = in_array($ext, ['jpg', 'jpeg', 'png', 'gif']) ? 'image' : 'video';
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
+    } else {
+        $message = trim($_POST['message']);
+        
+        $media = null;
+        $type = null;
+        
+        if (!empty($_FILES['media']['name'])) {
+            $media = uploadFile($_FILES['media']);
+            if ($media) {
+                $ext = strtolower(pathinfo($media, PATHINFO_EXTENSION));
+                $type = in_array($ext, ['jpg', 'jpeg', 'png', 'gif']) ? 'image' : 'video';
+            }
         }
-    }
-    
-    if ($message) {
-        $stmt = $pdo->prepare("INSERT INTO discussions(user_id, message, media, type_media) VALUES(?, ?, ?, ?)");
-        if ($stmt->execute([$_SESSION['user']['id'], $message, $media, $type])) {
-            header('Location: ?page=discussion');
-            exit;
+        
+        if ($message) {
+            $stmt = $pdo->prepare("INSERT INTO discussions(user_id, message, media, type_media) VALUES(?, ?, ?, ?)");
+            if ($stmt->execute([$_SESSION['user']['id'], $message, $media, $type])) {
+                header('Location: ?page=discussion');
+                exit;
+            }
         }
     }
 }
 
-// 7.10 : Like message discussion
+// 7.14 : Répondre à une discussion
+if (isset($_POST['add_reponse']) && isset($_SESSION['user'])) {
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
+    } else {
+        $discussion_id = $_POST['discussion_id'] ?? 0;
+        $message = trim($_POST['message']);
+        
+        $media = null;
+        $type = null;
+        
+        if (!empty($_FILES['media']['name'])) {
+            $media = uploadFile($_FILES['media']);
+            if ($media) {
+                $ext = strtolower(pathinfo($media, PATHINFO_EXTENSION));
+                $type = in_array($ext, ['jpg', 'jpeg', 'png', 'gif']) ? 'image' : 'video';
+            }
+        }
+        
+        if ($discussion_id && $message) {
+            $stmt = $pdo->prepare("INSERT INTO discussion_reponses(discussion_id, user_id, message, media, type_media) VALUES(?, ?, ?, ?, ?)");
+            if ($stmt->execute([$discussion_id, $_SESSION['user']['id'], $message, $media, $type])) {
+                createNotification($pdo, $_SESSION['user']['id'], 'Vous avez répondu à une discussion', 'reponse');
+                header('Location: ?page=discussion&view=' . $discussion_id);
+                exit;
+            }
+        }
+    }
+}
+
+// 7.15 : Like message discussion ou réponse
 if ($action == 'like_message' && isset($_SESSION['user'])) {
     $id = $_GET['id'] ?? 0;
+    $type = $_GET['type'] ?? 'discussion';
     if ($id) {
-        $stmt = $pdo->prepare("UPDATE discussions SET likes = likes + 1 WHERE id = ?");
-        $stmt->execute([$id]);
-        echo json_encode(['success' => true]);
+        $result = addLike($pdo, $_SESSION['user']['id'], $type, $id);
+        echo json_encode(['success' => $result, 'alreadyLiked' => !$result]);
         exit;
     }
 }
 
-// 7.11 : Message privé
+// 7.16 : Message privé
 if (isset($_POST['send_message']) && isset($_SESSION['user'])) {
-    $receiver_id = $_POST['receiver_id'] ?? 0;
-    $message = trim($_POST['message']);
-    
-    if ($receiver_id && $message) {
-        $stmt = $pdo->prepare("INSERT INTO messages_prives(sender_id, receiver_id, message) VALUES(?, ?, ?)");
-        if ($stmt->execute([$_SESSION['user']['id'], $receiver_id, $message])) {
-            createNotification($pdo, $receiver_id, 'Vous avez reçu un nouveau message', 'message');
-            $_SESSION['success'] = 'Message envoyé avec succès !';
-            header('Location: ?page=messages&user=' . $receiver_id);
-            exit;
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error'] = 'Erreur de sécurité.';
+    } else {
+        $receiver_id = $_POST['receiver_id'] ?? 0;
+        $message = trim($_POST['message']);
+        
+        if ($receiver_id && $message) {
+            $stmt = $pdo->prepare("INSERT INTO messages_prives(sender_id, receiver_id, message) VALUES(?, ?, ?)");
+            if ($stmt->execute([$_SESSION['user']['id'], $receiver_id, $message])) {
+                createNotification($pdo, $receiver_id, 'Vous avez reçu un nouveau message de ' . $_SESSION['user']['prenom'], 'message');
+                $_SESSION['success'] = 'Message envoyé avec succès !';
+                header('Location: ?page=messages&user=' . $receiver_id);
+                exit;
+            }
         }
     }
 }
 
-// 7.12 : Marquer notification comme lue
+// 7.17 : Marquer notification comme lue
 if ($action == 'read_notification' && isset($_SESSION['user'])) {
     $id = $_GET['id'] ?? 0;
     if ($id) {
@@ -381,9 +704,6 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
     <style>
-        /* ===========================================
-           STYLE GRIS/BLANC ÉPURÉ
-        =========================================== */
         :root {
             --bg-primary: #f8f9fa;
             --bg-secondary: #ffffff;
@@ -465,11 +785,6 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             color: var(--text-primary);
         }
         
-        .logo-icon {
-            font-size: 1.5rem;
-            color: var(--accent-color);
-        }
-        
         h1 { font-size: 2rem; font-weight: 600; margin-bottom: 1rem; }
         h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 1rem; }
         h3 { font-size: 1.25rem; font-weight: 500; margin-bottom: 0.75rem; }
@@ -541,6 +856,22 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             color: white;
         }
         
+        .btn-danger {
+            background-color: var(--danger);
+            color: white;
+            border-color: var(--danger);
+        }
+        
+        .btn-google {
+            background-color: #fff;
+            color: #333;
+            border: 1px solid #ddd;
+        }
+        
+        .btn-google:hover {
+            background-color: #f8f8f8;
+        }
+        
         .btn-sm {
             padding: 0.25rem 0.75rem;
             font-size: 0.75rem;
@@ -593,6 +924,19 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             margin-bottom: 1rem;
             border: 1px solid transparent;
             font-size: 0.875rem;
+            animation: slideIn 0.3s ease;
+            box-shadow: var(--shadow-md);
+        }
+        
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
         }
         
         .alert-success {
@@ -605,6 +949,12 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             background-color: rgba(214, 48, 49, 0.1);
             color: var(--danger);
             border-color: rgba(214, 48, 49, 0.2);
+        }
+        
+        .alert-info {
+            background-color: rgba(9, 132, 227, 0.1);
+            color: var(--accent-color);
+            border-color: rgba(9, 132, 227, 0.2);
         }
         
         .nav-menu {
@@ -791,10 +1141,33 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             align-items: center;
             gap: 0.25rem;
             font-size: 0.875rem;
+            transition: all 0.2s ease;
         }
         
         .like-btn:hover {
             color: var(--danger);
+            transform: scale(1.05);
+        }
+        
+        .like-btn.liked {
+            color: var(--danger);
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        
+        .like-btn.liked i {
+            animation: heartBeat 0.3s ease;
+        }
+        
+        .like-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        
+        @keyframes heartBeat {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+            100% { transform: scale(1); }
         }
         
         .help-card {
@@ -817,6 +1190,29 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             font-size: 0.7rem;
             font-weight: 600;
             background-color: var(--border-light);
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        
+        .status-en_attente {
+            background-color: var(--warning);
+            color: #fff;
+        }
+        
+        .status-traite {
+            background-color: var(--success);
+            color: #fff;
+        }
+        
+        .status-refuse {
+            background-color: var(--danger);
+            color: #fff;
         }
         
         .products-header {
@@ -851,6 +1247,64 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             margin: 1rem 0;
         }
         
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        
+        .modal-content {
+            background-color: var(--bg-secondary);
+            margin: 15% auto;
+            padding: 2rem;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            max-width: 400px;
+        }
+        
+        .reponse-card {
+            background-color: var(--border-light);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            padding: 1rem;
+            margin: 0.5rem 0 0.5rem 2rem;
+        }
+        
+        .reponse-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        
+        .reponse-author {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .discussion-thread {
+            border-left: 2px solid var(--border-color);
+            padding-left: 1rem;
+        }
+        
+        .show-replies {
+            cursor: pointer;
+            color: var(--accent-color);
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+            display: inline-block;
+        }
+        
+        .show-replies:hover {
+            text-decoration: underline;
+        }
+        
         @media (max-width: 768px) {
             .header-content {
                 flex-direction: column;
@@ -864,7 +1318,7 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
 </head>
 <body>
 <div class="app-container">
-    <!-- EN-TÊTE SANS FLEUR ROSE -->
+    <!-- EN-TÊTE -->
     <header class="header">
         <div class="header-content">
             <div class="logo">
@@ -903,9 +1357,9 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                             <?php endif; ?>
                         </a>
                         <div class="user-avatar">
-                            <?= strtoupper(substr($_SESSION['user']['nom'], 0, 1)) ?>
+                            <?= strtoupper(substr($_SESSION['user']['prenom'] ?? $_SESSION['user']['nom'], 0, 1)) ?>
                         </div>
-                        <span style="font-size: 0.875rem;"><?= htmlspecialchars($_SESSION['user']['nom']) ?></span>
+                        <span style="font-size: 0.875rem;"><?= htmlspecialchars($_SESSION['user']['prenom'] . ' ' . $_SESSION['user']['nom']) ?></span>
                         <a href="?page=logout" class="nav-link">
                             <i class="fas fa-sign-out-alt"></i>
                         </a>
@@ -954,12 +1408,24 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             <div class="card" style="max-width: 400px; margin: 4rem auto;">
                 <h2 style="text-align: center;">Connexion</h2>
                 <form method="post">
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                     <div class="form-group">
                         <label class="form-label">Email</label>
                         <input type="email" name="email" class="form-control" required>
                     </div>
-                    <button type="submit" name="login" class="btn btn-primary" style="width: 100%;">Se connecter</button>
+                    <div class="form-group">
+                        <label class="form-label">Mot de passe</label>
+                        <input type="password" name="password" class="form-control" required>
+                    </div>
+                    <button type="submit" name="login" class="btn btn-primary" style="width: 100%; margin-bottom: 1rem;">Se connecter</button>
                 </form>
+                
+                <div class="divider">ou</div>
+                
+                <a href="?google_login=1" class="btn btn-google" style="width: 100%;">
+                    <i class="fab fa-google"></i> Se connecter avec Google
+                </a>
+                
                 <div class="divider"></div>
                 <p style="text-align: center; font-size: 0.875rem;">
                     Pas encore de compte ? <a href="?page=register" style="color: var(--accent-color);">S'inscrire</a>
@@ -971,13 +1437,32 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             <div class="card" style="max-width: 400px; margin: 4rem auto;">
                 <h2 style="text-align: center;">Inscription</h2>
                 <form method="post">
-                    <div class="form-group">
-                        <label class="form-label">Nom complet</label>
-                        <input type="text" name="nom" class="form-control" required>
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                    <div class="grid grid-2" style="gap: 1rem;">
+                        <div class="form-group">
+                            <label class="form-label">Nom</label>
+                            <input type="text" name="nom" class="form-control" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Prénom</label>
+                            <input type="text" name="prenom" class="form-control" required>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Email</label>
                         <input type="email" name="email" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Téléphone</label>
+                        <input type="tel" name="telephone" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Mot de passe (min. 8 caractères, 1 majuscule, 1 chiffre)</label>
+                        <input type="password" name="password" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Confirmer le mot de passe</label>
+                        <input type="password" name="confirm_password" class="form-control" required>
                     </div>
                     <button type="submit" name="register" class="btn btn-primary" style="width: 100%;">S'inscrire</button>
                 </form>
@@ -987,9 +1472,33 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                 </p>
             </div>
         
+        <!-- PAGE DE VÉRIFICATION DU MOT DE PASSE POUR SUPPRESSION -->
+        <?php elseif ($page == 'verify_delete_password' && isset($_SESSION['user']) && isset($_SESSION['delete_article_id'])): ?>
+            <div class="card" style="max-width: 400px; margin: 4rem auto;">
+                <h2 style="text-align: center;">Confirmation de suppression</h2>
+                <p style="text-align: center; margin-bottom: 1.5rem;">Veuillez entrer vos mots de passe pour confirmer la suppression.</p>
+                
+                <form method="post">
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                    <div class="form-group">
+                        <label class="form-label">Votre mot de passe</label>
+                        <input type="password" name="password" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Mot de passe administrateur</label>
+                        <input type="password" name="admin_password" class="form-control" required>
+                    </div>
+                    <button type="submit" name="verify_delete_password" class="btn btn-danger" style="width: 100%;">
+                        <i class="fas fa-trash"></i> Confirmer la suppression
+                    </button>
+                    <a href="?page=articles" class="btn" style="width: 100%; margin-top: 0.5rem;">Annuler</a>
+                </form>
+            </div>
+        
         <!-- DASHBOARD -->
         <?php elseif ($page == 'dashboard' && isset($_SESSION['user'])):
             $userId = $_SESSION['user']['id'];
+            
             $testimonialsCount = $pdo->prepare("SELECT COUNT(*) FROM temoignages WHERE user_id = ?");
             $testimonialsCount->execute([$userId]);
             $testimonialsCount = $testimonialsCount->fetchColumn();
@@ -1001,10 +1510,22 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             $articlesCount = $pdo->prepare("SELECT COUNT(*) FROM articles WHERE user_id = ?");
             $articlesCount->execute([$userId]);
             $articlesCount = $articlesCount->fetchColumn();
+            
+            $pendingHelpCount = $pdo->prepare("SELECT COUNT(*) FROM demandes_aide WHERE user_id = ? AND status = 'en_attente'");
+            $pendingHelpCount->execute([$userId]);
+            $pendingHelpCount = $pendingHelpCount->fetchColumn();
+
+            $discussionsCount = $pdo->prepare("SELECT COUNT(*) FROM discussions WHERE user_id = ?");
+            $discussionsCount->execute([$userId]);
+            $discussionsCount = $discussionsCount->fetchColumn();
+
+            $reponsesCount = $pdo->prepare("SELECT COUNT(*) FROM discussion_reponses WHERE user_id = ?");
+            $reponsesCount->execute([$userId]);
+            $reponsesCount = $reponsesCount->fetchColumn();
             ?>
             
             <div style="margin-bottom: 2rem;">
-                <h1>Bonjour, <?= htmlspecialchars($_SESSION['user']['nom']) ?></h1>
+                <h1>Bonjour, <?= htmlspecialchars($_SESSION['user']['prenom'] . ' ' . $_SESSION['user']['nom']) ?></h1>
                 <p style="color: var(--text-secondary);">Bienvenue sur votre tableau de bord</p>
             </div>
             
@@ -1016,10 +1537,17 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                 <div class="stat-card">
                     <div class="stat-number"><?= $helpRequestsCount ?></div>
                     <div class="stat-label">Demandes d'aide</div>
+                    <?php if ($pendingHelpCount > 0): ?>
+                    <div style="font-size: 0.7rem; color: var(--warning);"><?= $pendingHelpCount ?> en attente</div>
+                    <?php endif; ?>
                 </div>
                 <div class="stat-card">
                     <div class="stat-number"><?= $articlesCount ?></div>
                     <div class="stat-label">Articles</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number"><?= $discussionsCount + $reponsesCount ?></div>
+                    <div class="stat-label">Messages</div>
                 </div>
             </div>
             
@@ -1029,15 +1557,37 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                 <a href="?page=articles" class="btn"><i class="fas fa-shopping-bag"></i> Vendre un article</a>
                 <a href="?page=discussion" class="btn"><i class="fas fa-comment-dots"></i> Discussion</a>
             </div>
+            
+            <!-- Dernières demandes d'aide -->
+            <?php
+            $recentHelps = $pdo->prepare("SELECT * FROM demandes_aide WHERE user_id = ? ORDER BY date_demande DESC LIMIT 3");
+            $recentHelps->execute([$userId]);
+            if ($recentHelps->rowCount() > 0):
+            ?>
+            <div style="margin-top: 2rem;">
+                <h3>Dernières demandes d'aide</h3>
+                <?php while ($h = $recentHelps->fetch()): ?>
+                <div class="help-card urgence-<?= $h['urgence'] ?>">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <h4 style="margin: 0;"><?= htmlspecialchars($h['situation']) ?></h4>
+                        <span class="status-badge status-<?= $h['status'] ?>"><?= $h['status'] ?></span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.5rem;">
+                        <?= formatDate($h['date_demande']) ?>
+                    </div>
+                </div>
+                <?php endwhile; ?>
+            </div>
+            <?php endif; ?>
         
         <!-- PAGE TÉMOIGNAGES -->
         <?php elseif ($page == 'temoignages' && isset($_SESSION['user'])): ?>
             <h2>Témoignages</h2>
             
-            <!-- Formulaire d'ajout -->
             <div class="card">
                 <h3 class="card-title">Partagez votre expérience</h3>
                 <form method="post">
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                     <div class="form-group">
                         <label class="form-label">Catégorie</label>
                         <select name="categorie" class="form-control">
@@ -1057,11 +1607,10 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                 </form>
             </div>
             
-            <!-- Liste des témoignages -->
             <h3>Témoignages de la communauté</h3>
             <?php
             $testimonials = $pdo->query("
-                SELECT t.*, u.nom 
+                SELECT t.*, u.nom, u.prenom 
                 FROM temoignages t 
                 JOIN users u ON u.id = t.user_id 
                 WHERE t.approved = TRUE 
@@ -1069,13 +1618,14 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             ");
             
             while ($t = $testimonials->fetch()):
+                $hasLiked = hasUserLiked($pdo, $_SESSION['user']['id'], 'temoignage', $t['id']);
             ?>
             <div class="testimonial-card">
                 <div class="testimonial-header">
                     <div class="testimonial-author">
-                        <div class="user-avatar"><?= strtoupper(substr($t['nom'], 0, 1)) ?></div>
+                        <div class="user-avatar"><?= strtoupper(substr($t['prenom'] ?? $t['nom'], 0, 1)) ?></div>
                         <div>
-                            <div style="font-weight: 600;"><?= htmlspecialchars($t['nom']) ?></div>
+                            <div style="font-weight: 600;"><?= htmlspecialchars($t['prenom'] . ' ' . $t['nom']) ?></div>
                             <?php if ($t['categorie']): ?>
                             <div style="font-size: 0.7rem; color: var(--accent-color);">#<?= htmlspecialchars($t['categorie']) ?></div>
                             <?php endif; ?>
@@ -1084,8 +1634,8 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                     <div style="font-size: 0.75rem; color: var(--text-secondary);"><?= formatDate($t['date_pub']) ?></div>
                 </div>
                 <div style="margin-bottom: 1rem;"><?= nl2br(htmlspecialchars($t['message'])) ?></div>
-                <button class="like-btn" onclick="likeTestimonial(<?= $t['id'] ?>)">
-                    <i class="fas fa-heart"></i> <?= $t['likes'] ?>
+                <button class="like-btn <?= $hasLiked ? 'liked' : '' ?>" onclick="likeTestimonial(<?= $t['id'] ?>)" <?= $hasLiked ? 'disabled' : '' ?>>
+                    <i class="fas fa-heart"></i> <span class="like-count"><?= $t['likes'] ?></span>
                 </button>
             </div>
             <?php endwhile; ?>
@@ -1097,6 +1647,7 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             <div class="card">
                 <h3 class="card-title">Formulaire de demande d'assistance</h3>
                 <form method="post">
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                     <div class="form-group">
                         <label class="form-label">Situation</label>
                         <select name="situation" class="form-control" required>
@@ -1148,22 +1699,37 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                     <span class="urgence-badge"><?= $d['urgence'] ?></span>
                 </div>
                 <div style="margin-bottom: 0.5rem; font-size: 0.875rem;"><?= nl2br(htmlspecialchars($d['circonstances'])) ?></div>
-                <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-secondary);">
-                    <span>Statut: <?= $d['status'] ?></span>
+                <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; color: var(--text-secondary);">
+                    <div>
+                        <span class="status-badge status-<?= $d['status'] ?>"><?= $d['status'] ?></span>
+                        <?php if ($d['date_traitement']): ?>
+                        <span style="margin-left: 0.5rem;">Traité le <?= date('d/m/Y', strtotime($d['date_traitement'])) ?></span>
+                        <?php endif; ?>
+                    </div>
                     <span><?= formatDate($d['date_demande']) ?></span>
                 </div>
+                
+                <?php if ($d['status'] == 'en_attente'): ?>
+                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
+                    <a href="?action=update_help_status&id=<?= $d['id'] ?>&status=traite" class="btn btn-sm btn-success" onclick="return confirm('Marquer cette demande comme traitée ?')">
+                        <i class="fas fa-check"></i> Marquer comme traitée
+                    </a>
+                    <a href="?action=update_help_status&id=<?= $d['id'] ?>&status=refuse" class="btn btn-sm btn-danger" style="margin-left: 0.5rem;" onclick="return confirm('Refuser cette demande ?')">
+                        <i class="fas fa-times"></i> Refuser
+                    </a>
+                </div>
+                <?php endif; ?>
             </div>
             <?php endwhile; ?>
         
         <!-- PAGE ARTICLES -->
         <?php elseif ($page == 'articles' && isset($_SESSION['user'])):
-            // Récupérer les filtres
             $search = $_GET['search'] ?? '';
             $categorie = $_GET['categorie'] ?? '';
             $prix_range = $_GET['prix'] ?? '';
             $sort = $_GET['sort'] ?? 'recent';
             
-            $sql = "SELECT a.*, u.nom FROM articles a JOIN users u ON u.id = a.user_id WHERE a.vendu = FALSE";
+            $sql = "SELECT a.*, u.nom, u.prenom FROM articles a JOIN users u ON u.id = a.user_id WHERE a.vendu = FALSE";
             $params = [];
             
             if (!empty($search)) {
@@ -1201,7 +1767,6 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
             ?>
             
             <div style="display: flex; gap: 2rem; flex-wrap: wrap;">
-                <!-- Sidebar filtres -->
                 <div class="filter-sidebar">
                     <div class="card" style="position: sticky; top: 100px;">
                         <h3 style="font-size: 1rem; margin-bottom: 1rem;">Filtres</h3>
@@ -1261,7 +1826,6 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                     </div>
                 </div>
                 
-                <!-- Liste des articles -->
                 <div style="flex: 1;">
                     <div class="products-header">
                         <div>
@@ -1317,12 +1881,15 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                                 <div class="article-category"><?= htmlspecialchars($a['categorie']) ?></div>
                                 <?php endif; ?>
                                 <div class="article-price"><?= number_format($a['prix'], 0, ',', ' ') ?> FCFA</div>
-                                <div style="font-size: 0.7rem; color: var(--text-muted);">Par <?= htmlspecialchars($a['nom']) ?></div>
+                                <div style="font-size: 0.7rem; color: var(--text-muted);">Par <?= htmlspecialchars($a['prenom'] . ' ' . $a['nom']) ?></div>
                                 
                                 <?php if ($a['user_id'] == $_SESSION['user']['id']): ?>
-                                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
-                                    <a href="?page=articles&action=mark_sold&id=<?= $a['id'] ?>" class="btn btn-sm" style="width: 100%;" onclick="return confirm('Marquer comme vendu ?')">
-                                        <i class="fas fa-check"></i> Marquer vendu
+                                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color); display: flex; gap: 0.5rem;">
+                                    <a href="?page=articles&action=mark_sold&id=<?= $a['id'] ?>" class="btn btn-sm btn-success" style="flex: 1;" onclick="return confirm('Marquer comme vendu ?')">
+                                        <i class="fas fa-check"></i> Vendu
+                                    </a>
+                                    <a href="?page=articles&action=delete_article&id=<?= $a['id'] ?>" class="btn btn-sm btn-danger" style="flex: 1;" onclick="return confirm('Voulez-vous supprimer cet article ?')">
+                                        <i class="fas fa-trash"></i> Supprimer
                                     </a>
                                 </div>
                                 <?php endif; ?>
@@ -1338,15 +1905,15 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                     </div>
                     <?php endif; ?>
                     
-                    <!-- Formulaire d'ajout d'article -->
                     <div id="add-product-form" style="display: none; margin-top: 2rem;">
                         <div class="card">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                                 <h3 style="font-size: 1rem;">Vendre un article</h3>
-                                <button onclick="this.parentElement.parentElement.parentElement.style.display = 'none'" style="background: none; border: none; cursor: pointer;">&times;</button>
+                                <button onclick="this.parentElement.parentElement.parentElement.style.display = 'none'" style="background: none; border: none; cursor: pointer; font-size: 1.5rem;">&times;</button>
                             </div>
                             
                             <form method="post" enctype="multipart/form-data">
+                                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                                 <div class="grid grid-2" style="gap: 1rem;">
                                     <div class="form-group">
                                         <label class="form-label">Titre</label>
@@ -1393,59 +1960,192 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                 </div>
             </div>
         
-        <!-- PAGE DISCUSSION -->
-        <?php elseif ($page == 'discussion' && isset($_SESSION['user'])): ?>
-            <h2>Discussion</h2>
-            
-            <div class="card">
-                <h3 class="card-title">Nouveau message</h3>
-                <form method="post" enctype="multipart/form-data">
-                    <div class="form-group">
-                        <textarea name="message" class="form-control" placeholder="Votre message..." rows="3" required></textarea>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Média (optionnel)</label>
-                        <input type="file" name="media" accept="image/*,video/*" class="form-control">
-                    </div>
-                    <button type="submit" name="add_discussion" class="btn btn-primary">Publier</button>
-                </form>
-            </div>
-            
-            <?php
-            $discussions = $pdo->query("
-                SELECT d.*, u.nom 
-                FROM discussions d 
-                JOIN users u ON u.id = d.user_id 
-                ORDER BY d.date_msg DESC
-            ");
-            
-            while ($d = $discussions->fetch()):
+        <!-- PAGE DISCUSSION AVEC RÉPONSES -->
+        <?php elseif ($page == 'discussion' && isset($_SESSION['user'])):
+            $view_discussion = $_GET['view'] ?? null;
             ?>
-            <div class="testimonial-card">
-                <div class="testimonial-header">
-                    <div class="testimonial-author">
-                        <div class="user-avatar"><?= strtoupper(substr($d['nom'], 0, 1)) ?></div>
-                        <div>
-                            <div style="font-weight: 600;"><?= htmlspecialchars($d['nom']) ?></div>
-                            <div style="font-size: 0.7rem; color: var(--text-secondary);"><?= formatDate($d['date_msg']) ?></div>
-                        </div>
-                    </div>
-                    <button class="like-btn" onclick="likeMessage(<?= $d['id'] ?>)">
-                        <i class="fas fa-heart"></i> <?= $d['likes'] ?>
-                    </button>
+            
+            <?php if ($view_discussion): 
+                $discussion = $pdo->prepare("
+                    SELECT d.*, u.nom, u.prenom 
+                    FROM discussions d 
+                    JOIN users u ON u.id = d.user_id 
+                    WHERE d.id = ?
+                ");
+                $discussion->execute([$view_discussion]);
+                $discussion = $discussion->fetch();
+                
+                if (!$discussion):
+                    header('Location: ?page=discussion');
+                    exit;
+                endif;
+                
+                $hasLiked = hasUserLiked($pdo, $_SESSION['user']['id'], 'discussion', $discussion['id']);
+                
+                $reponses = $pdo->prepare("
+                    SELECT r.*, u.nom, u.prenom 
+                    FROM discussion_reponses r 
+                    JOIN users u ON u.id = r.user_id 
+                    WHERE r.discussion_id = ? 
+                    ORDER BY r.date_reponse ASC
+                ");
+                $reponses->execute([$view_discussion]);
+                ?>
+                
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                    <h2>Discussion</h2>
+                    <a href="?page=discussion" class="btn btn-sm">
+                        <i class="fas fa-arrow-left"></i> Retour
+                    </a>
                 </div>
-                <div style="margin-bottom: 1rem;"><?= nl2br(htmlspecialchars($d['message'])) ?></div>
-                <?php if ($d['media']): ?>
-                <div style="margin-top: 1rem;">
-                    <?php if ($d['type_media'] == 'image'): ?>
-                    <img src="<?= UPLOAD_DIR . htmlspecialchars($d['media']) ?>" style="max-width: 100%; border-radius: var(--radius-sm);">
-                    <?php else: ?>
-                    <video src="<?= UPLOAD_DIR . htmlspecialchars($d['media']) ?>" controls style="max-width: 100%;"></video>
+                
+                <div class="testimonial-card">
+                    <div class="testimonial-header">
+                        <div class="testimonial-author">
+                            <div class="user-avatar"><?= strtoupper(substr($discussion['prenom'] ?? $discussion['nom'], 0, 1)) ?></div>
+                            <div>
+                                <div style="font-weight: 600;"><?= htmlspecialchars($discussion['prenom'] . ' ' . $discussion['nom']) ?></div>
+                                <div style="font-size: 0.7rem; color: var(--text-secondary);"><?= formatDate($discussion['date_msg']) ?></div>
+                            </div>
+                        </div>
+                        <button class="like-btn <?= $hasLiked ? 'liked' : '' ?>" onclick="likeMessage(<?= $discussion['id'] ?>, 'discussion')" <?= $hasLiked ? 'disabled' : '' ?>>
+                            <i class="fas fa-heart"></i> <span class="like-count"><?= $discussion['likes'] ?></span>
+                        </button>
+                    </div>
+                    <div style="margin-bottom: 1rem;"><?= nl2br(htmlspecialchars($discussion['message'])) ?></div>
+                    <?php if ($discussion['media']): ?>
+                    <div style="margin-top: 1rem;">
+                        <?php if ($discussion['type_media'] == 'image'): ?>
+                        <img src="<?= UPLOAD_DIR . htmlspecialchars($discussion['media']) ?>" style="max-width: 100%; border-radius: var(--radius-sm);">
+                        <?php else: ?>
+                        <video src="<?= UPLOAD_DIR . htmlspecialchars($discussion['media']) ?>" controls style="max-width: 100%;"></video>
+                        <?php endif; ?>
+                    </div>
                     <?php endif; ?>
                 </div>
+                
+                <div class="card" style="margin-top: 1rem;">
+                    <h3 class="card-title">Répondre</h3>
+                    <form method="post" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                        <input type="hidden" name="discussion_id" value="<?= $view_discussion ?>">
+                        <div class="form-group">
+                            <textarea name="message" class="form-control" placeholder="Votre réponse..." rows="3" required></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Média (optionnel)</label>
+                            <input type="file" name="media" accept="image/*,video/*" class="form-control">
+                        </div>
+                        <button type="submit" name="add_reponse" class="btn btn-primary">Publier la réponse</button>
+                    </form>
+                </div>
+                
+                <h3 style="margin-top: 2rem;">Réponses (<?= $reponses->rowCount() ?>)</h3>
+                
+                <?php if ($reponses->rowCount() == 0): ?>
+                <div class="empty-state">
+                    <i class="fas fa-comment-dots"></i>
+                    <p>Aucune réponse pour le moment. Soyez le premier à répondre !</p>
+                </div>
+                <?php else: 
+                    while ($r = $reponses->fetch()):
+                        $hasLikedReponse = hasUserLiked($pdo, $_SESSION['user']['id'], 'reponse', $r['id']);
+                ?>
+                <div class="reponse-card">
+                    <div class="reponse-header">
+                        <div class="reponse-author">
+                            <div class="user-avatar" style="width: 24px; height: 24px; font-size: 0.7rem;"><?= strtoupper(substr($r['prenom'] ?? $r['nom'], 0, 1)) ?></div>
+                            <div>
+                                <span style="font-weight: 600; font-size: 0.875rem;"><?= htmlspecialchars($r['prenom'] . ' ' . $r['nom']) ?></span>
+                                <span style="font-size: 0.7rem; color: var(--text-secondary); margin-left: 0.5rem;"><?= formatDate($r['date_reponse']) ?></span>
+                            </div>
+                        </div>
+                        <button class="like-btn <?= $hasLikedReponse ? 'liked' : '' ?>" style="font-size: 0.75rem;" onclick="likeMessage(<?= $r['id'] ?>, 'reponse')" <?= $hasLikedReponse ? 'disabled' : '' ?>>
+                            <i class="fas fa-heart"></i> <span class="like-count"><?= $r['likes'] ?></span>
+                        </button>
+                    </div>
+                    <div><?= nl2br(htmlspecialchars($r['message'])) ?></div>
+                    <?php if ($r['media']): ?>
+                    <div style="margin-top: 0.5rem;">
+                        <?php if ($r['type_media'] == 'image'): ?>
+                        <img src="<?= UPLOAD_DIR . htmlspecialchars($r['media']) ?>" style="max-width: 200px; border-radius: var(--radius-sm);">
+                        <?php else: ?>
+                        <video src="<?= UPLOAD_DIR . htmlspecialchars($r['media']) ?>" controls style="max-width: 200px;"></video>
+                        <?php endif; ?>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <?php endwhile; ?>
                 <?php endif; ?>
-            </div>
-            <?php endwhile; ?>
+                
+            <?php else: 
+                ?>
+                <h2>Discussion</h2>
+                
+                <div class="card">
+                    <h3 class="card-title">Nouveau message</h3>
+                    <form method="post" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                        <div class="form-group">
+                            <textarea name="message" class="form-control" placeholder="Votre message..." rows="3" required></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Média (optionnel)</label>
+                            <input type="file" name="media" accept="image/*,video/*" class="form-control">
+                        </div>
+                        <button type="submit" name="add_discussion" class="btn btn-primary">Publier</button>
+                    </form>
+                </div>
+                
+                <?php
+                $discussions = $pdo->query("
+                    SELECT d.*, u.nom, u.prenom,
+                           (SELECT COUNT(*) FROM discussion_reponses WHERE discussion_id = d.id) as reponses_count
+                    FROM discussions d 
+                    JOIN users u ON u.id = d.user_id 
+                    ORDER BY d.date_msg DESC
+                ");
+                
+                while ($d = $discussions->fetch()):
+                    $hasLiked = hasUserLiked($pdo, $_SESSION['user']['id'], 'discussion', $d['id']);
+                ?>
+                <div class="testimonial-card">
+                    <div class="testimonial-header">
+                        <div class="testimonial-author">
+                            <div class="user-avatar"><?= strtoupper(substr($d['prenom'] ?? $d['nom'], 0, 1)) ?></div>
+                            <div>
+                                <div style="font-weight: 600;"><?= htmlspecialchars($d['prenom'] . ' ' . $d['nom']) ?></div>
+                                <div style="font-size: 0.7rem; color: var(--text-secondary);"><?= formatDate($d['date_msg']) ?></div>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 1rem; align-items: center;">
+                            <span class="badge" style="background-color: var(--border-light); padding: 0.25rem 0.5rem; border-radius: 12px; font-size: 0.7rem;">
+                                <i class="fas fa-comment"></i> <?= $d['reponses_count'] ?> réponse(s)
+                            </span>
+                            <button class="like-btn <?= $hasLiked ? 'liked' : '' ?>" onclick="likeMessage(<?= $d['id'] ?>, 'discussion')" <?= $hasLiked ? 'disabled' : '' ?>>
+                                <i class="fas fa-heart"></i> <span class="like-count"><?= $d['likes'] ?></span>
+                            </button>
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 1rem;"><?= nl2br(htmlspecialchars($d['message'])) ?></div>
+                    <?php if ($d['media']): ?>
+                    <div style="margin-top: 1rem;">
+                        <?php if ($d['type_media'] == 'image'): ?>
+                        <img src="<?= UPLOAD_DIR . htmlspecialchars($d['media']) ?>" style="max-width: 100%; border-radius: var(--radius-sm);">
+                        <?php else: ?>
+                        <video src="<?= UPLOAD_DIR . htmlspecialchars($d['media']) ?>" controls style="max-width: 100%;"></video>
+                        <?php endif; ?>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
+                        <a href="?page=discussion&view=<?= $d['id'] ?>" class="btn btn-sm btn-primary">
+                            <i class="fas fa-reply"></i> Voir la discussion (<?= $d['reponses_count'] ?>)
+                        </a>
+                    </div>
+                </div>
+                <?php endwhile; ?>
+            <?php endif; ?>
         
         <!-- PAGE NOTIFICATIONS -->
         <?php elseif ($page == 'notifications' && isset($_SESSION['user'])): ?>
@@ -1468,7 +2168,7 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
                 </div>
                 <?php if (!$n['lu']): ?>
                 <div style="margin-top: 0.5rem;">
-                    <a href="?page=notifications&action=read_notification&id=<?= $n['id'] ?>" class="btn btn-sm">Marquer comme lu</a>
+                    <a href="?action=read_notification&id=<?= $n['id'] ?>" class="btn btn-sm">Marquer comme lu</a>
                 </div>
                 <?php endif; ?>
             </div>
@@ -1481,26 +2181,96 @@ if ($action == 'read_notification' && isset($_SESSION['user'])) {
     </main>
 
     <!-- PIED DE PAGE -->
-    <?php if ($page != 'login' && $page != 'register'): ?>
+    <?php if ($page != 'login' && $page != 'register' && $page != 'verify_delete_password'): ?>
     <footer class="footer">
         <div style="text-align: center;">
-            <p style="font-size: 0.875rem;">&copy; <?= date('Y') ?> W-ASSIST</p>
+            <p style="font-size: 0.875rem;">&copy; <?= date('Y') ?> W-ASSIST - Plateforme d'Assistance aux Femmes</p>
         </div>
     </footer>
     <?php endif; ?>
 </div>
 
 <script>
+let likeInProgress = false;
+
 function likeTestimonial(id) {
+    if (likeInProgress) return;
+    likeInProgress = true;
+    
+    const button = event.currentTarget;
+    const countSpan = button.querySelector('.like-count');
+    const originalCount = parseInt(countSpan.textContent);
+    
     fetch(`?action=like_temoignage&id=${id}`)
         .then(response => response.json())
-        .then(data => { if (data.success) location.reload(); });
+        .then(data => {
+            if (data.success) {
+                countSpan.textContent = originalCount + 1;
+                button.classList.add('liked');
+                button.disabled = true;
+                showNotification('Témoignage aimé !', 'success');
+            } else if (data.alreadyLiked) {
+                showNotification('Vous avez déjà aimé ce témoignage', 'info');
+            }
+        })
+        .catch(error => {
+            console.error('Erreur:', error);
+            showNotification('Une erreur est survenue', 'error');
+        })
+        .finally(() => {
+            likeInProgress = false;
+        });
 }
 
-function likeMessage(id) {
-    fetch(`?action=like_message&id=${id}`)
+function likeMessage(id, type = 'discussion') {
+    if (likeInProgress) return;
+    likeInProgress = true;
+    
+    const button = event.currentTarget;
+    const countSpan = button.querySelector('.like-count');
+    const originalCount = parseInt(countSpan.textContent);
+    
+    fetch(`?action=like_message&id=${id}&type=${type}`)
         .then(response => response.json())
-        .then(data => { if (data.success) location.reload(); });
+        .then(data => {
+            if (data.success) {
+                countSpan.textContent = originalCount + 1;
+                button.classList.add('liked');
+                button.disabled = true;
+                showNotification('Message aimé !', 'success');
+            } else if (data.alreadyLiked) {
+                showNotification('Vous avez déjà aimé ce message', 'info');
+            }
+        })
+        .catch(error => {
+            console.error('Erreur:', error);
+            showNotification('Une erreur est survenue', 'error');
+        })
+        .finally(() => {
+            likeInProgress = false;
+        });
+}
+
+function showNotification(message, type = 'info') {
+    const notification = document.createElement('div');
+    notification.className = `alert alert-${type}`;
+    notification.style.position = 'fixed';
+    notification.style.top = '20px';
+    notification.style.right = '20px';
+    notification.style.zIndex = '9999';
+    notification.style.maxWidth = '300px';
+    notification.innerHTML = `
+        <i class="fas fa-${type === 'success' ? 'check-circle' : 
+                           type === 'error' ? 'exclamation-circle' : 
+                           'info-circle'}"></i>
+        ${message}
+    `;
+    
+    document.body.appendChild(notification);
+    
+    setTimeout(() => {
+        notification.remove();
+    }, 3000);
 }
 
 setTimeout(() => {
@@ -1508,4 +2278,4 @@ setTimeout(() => {
 }, 5000);
 </script>
 </body>
-</html>s
+</html>
